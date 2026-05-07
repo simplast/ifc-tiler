@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ifc-tiler"
+version = "0.1.0"
+description = "CLI pipeline for converting IFC into 3D Tiles outputs."
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "ifc-tiler" }]
+dependencies = [
+  "ifcopenshell",
+  "numpy",
+  "trimesh",
+  "scipy",
+]
+
+[project.scripts]
+ifc-tiler = "ifc_tiler.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
