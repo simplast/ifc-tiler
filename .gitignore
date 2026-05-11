@@ -21,3 +21,6 @@ venv/
 
 # Outputs
 outputs
+
+3dtiles
+*.ifc

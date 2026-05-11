@@ -8,6 +8,7 @@ import uuid
 from pathlib import Path
 
 from ifc_tiler.adapters.external_converter import run_native_converter
+from ifc_tiler.adapters.py3dtiles_converter import run_py3dtiles_converter
 from ifc_tiler.config import (
     ConvertConfig,
     EXIT_CONVERTER_FAILED,
@@ -16,6 +17,9 @@ from ifc_tiler.config import (
     EXIT_OUTPUT_CONFLICT,
     EXIT_OUTPUT_INVALID,
 )
+from ifc_tiler.ifc_preclean import preclean_ifc_for_py3dtiles
+
+NATIVE_GEOMETRY_CACHE_VERSION = 1
 
 
 def run_convert(config: ConvertConfig) -> int:
@@ -49,12 +53,62 @@ def run_convert(config: ConvertConfig) -> int:
     started = time.time()
     input_hash = _sha256_file(input_ifc)
 
-    converter_result = run_native_converter(
-        input_ifc=input_ifc,
-        output_dir=temp_converter_output,
-        log_file=convert_log,
-        timeout_min=config.timeout_min,
-    )
+    preclean_summary: dict | None = None
+    if config.backend == "py3dtiles":
+        precleaned_ifc = temp_root / "precleaned.ifc"
+        preclean_result = preclean_ifc_for_py3dtiles(
+            input_ifc=input_ifc,
+            output_ifc=precleaned_ifc,
+            skip_proxy_body_items_ge=config.skip_proxy_body_items_ge,
+            skip_brep_body_items_ge=config.skip_brep_body_items_ge,
+            skip_surface_body_items_ge=config.skip_surface_body_items_ge,
+        )
+        preclean_summary = preclean_result.to_dict()
+        print(
+            "[info] Precleaned IFC for py3dtiles: "
+            f"removed={preclean_result.removed_total} "
+            f"(no-body={preclean_result.removed_no_body_representation}, "
+            f"empty-body={preclean_result.removed_empty_body_items}, "
+            f"proxy={preclean_result.removed_proxy_body_items}, "
+            f"brep={preclean_result.removed_brep_body_items}, "
+            f"surface={preclean_result.removed_surface_body_items})"
+        )
+        converter_result = run_py3dtiles_converter(
+            input_ifc=precleaned_ifc,
+            output_dir=temp_converter_output,
+            log_file=convert_log,
+            timeout_min=config.timeout_min,
+        )
+    elif config.backend == "native":
+        native_cache_dir = _resolve_native_cache_dir(config, out_dir, input_hash)
+        converter_result = run_native_converter(
+            input_ifc=input_ifc,
+            output_dir=temp_converter_output,
+            log_file=convert_log,
+            timeout_min=config.timeout_min,
+            diagnostics=config.diagnostics,
+            color_mode=config.color_mode,
+            transform_mode=config.transform_mode,
+            max_shapes=config.max_shapes,
+            shape_range=config.shape_range,
+            tile_target_mb=config.tile_target_mb,
+            tile_max_mb=config.tile_max_mb,
+            max_tile_triangles=config.max_tile_triangles,
+            lod_mode=config.lod_mode,
+            lod_target_ratio=config.lod_target_ratio,
+            lod_min_faces=config.lod_min_faces,
+            meshopt=config.meshopt,
+            keep_temp=config.keep_temp,
+            skip_proxy_body_items_ge=config.skip_proxy_body_items_ge,
+            skip_brep_body_items_ge=config.skip_brep_body_items_ge,
+            skip_surface_body_items_ge=config.skip_surface_body_items_ge,
+            use_cache=config.use_cache,
+            rebuild_cache=config.rebuild_cache,
+            cache_dir=native_cache_dir,
+        )
+    else:
+        print(f"[error] Unsupported backend: {config.backend}")
+        return EXIT_INPUT_INVALID
     if not converter_result.ok:
         _persist_failure_logs(final_dir=final_dir, convert_log=convert_log, overwrite=config.overwrite)
         message = converter_result.error_message or "Unknown converter error."
@@ -77,6 +131,7 @@ def run_convert(config: ConvertConfig) -> int:
         print(f"[error] {validation_error}")
         return EXIT_OUTPUT_INVALID
 
+    stats_summary = _read_stats_summary(temp_normalized / "stats.json")
     manifest = {
         "input_ifc": str(input_ifc),
         "input_sha256": input_hash,
@@ -92,7 +147,30 @@ def run_convert(config: ConvertConfig) -> int:
             "overwrite": config.overwrite,
             "keep_temp": config.keep_temp,
             "timeout_min": config.timeout_min,
+            "diagnostics": config.diagnostics,
+            "color_mode": config.color_mode,
+            "transform_mode": config.transform_mode,
+            "max_shapes": config.max_shapes,
+            "shape_range": config.shape_range,
+            "tile_target_mb": config.tile_target_mb,
+            "tile_max_mb": config.tile_max_mb,
+            "max_tile_triangles": config.max_tile_triangles,
+            "lod_mode": config.lod_mode,
+            "lod_target_ratio": config.lod_target_ratio,
+            "lod_min_faces": config.lod_min_faces,
+            "meshopt": config.meshopt,
+            "skip_proxy_body_items_ge": config.skip_proxy_body_items_ge,
+            "skip_brep_body_items_ge": config.skip_brep_body_items_ge,
+            "skip_surface_body_items_ge": config.skip_surface_body_items_ge,
+            "use_cache": config.use_cache,
+            "rebuild_cache": config.rebuild_cache,
+            "cache_dir": str(config.cache_dir) if config.cache_dir else None,
+            "native_cache_key": _native_geometry_cache_key(config, input_hash) if config.backend == "native" else None,
+            "backend": config.backend,
         },
+        "stats_summary": stats_summary,
+        "preclean_summary": preclean_summary,
+        "compression": converter_result.compression,
     }
     (temp_normalized / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=True, indent=2),
@@ -186,3 +264,41 @@ def _sha256_file(path: Path) -> str:
                 break
             hasher.update(chunk)
     return hasher.hexdigest()
+
+
+def _resolve_native_cache_dir(config: ConvertConfig, out_dir: Path, input_hash: str) -> Path | None:
+    if not config.use_cache:
+        return None
+    base_dir = (config.cache_dir.expanduser() if config.cache_dir else (out_dir / ".cache" / "native-shapes")).resolve()
+    return base_dir / _native_geometry_cache_key(config, input_hash)
+
+
+def _native_geometry_cache_key(config: ConvertConfig, input_hash: str) -> str:
+    payload = {
+        "schema": NATIVE_GEOMETRY_CACHE_VERSION,
+        "input_sha256": input_hash,
+        "color_mode": config.color_mode,
+        "transform_mode": config.transform_mode,
+        "max_shapes": config.max_shapes,
+        "shape_range": list(config.shape_range) if config.shape_range else None,
+        "skip_proxy_body_items_ge": config.skip_proxy_body_items_ge,
+        "skip_brep_body_items_ge": config.skip_brep_body_items_ge,
+        "skip_surface_body_items_ge": config.skip_surface_body_items_ge,
+    }
+    encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def _read_stats_summary(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    tile_summary = data.get("tile_summary")
+    extraction_summary = data.get("extraction_summary")
+    return {
+        "extraction_summary": extraction_summary,
+        "tile_summary": tile_summary,
+    }
